@@ -1,0 +1,274 @@
+@load base/protocols/conn
+@load base/frameworks/input
+redef LogAscii::use_json = F;
+redef LogAscii::separator = "\t";
+
+module FeatureExtractor;
+
+export {
+    redef enum Log::ID += { Features };
+
+    global known_doh_resolvers: set[addr] &redef;
+    const doh_fetch_script = "/XX/fetch_doh_resolvers.sh" &redef;
+
+    const IDLE_TIMEOUT = 40sec &redef;
+    const MAX_DURATION = 90sec &redef;
+    const CHECK_INTERVAL = 5sec &redef;
+
+    type Info: record {
+        ts: time &log;
+        uid: string &log;
+        id: conn_id &log;
+        FlowBytesSent: count &log;
+        FlowSentRate: double &log;
+        FlowBytesReceived: count &log;
+        FlowReceivedRate: double &log;
+        PacketLengthMean: double &log;
+        PacketLengthVariance: double &log;
+        PacketLengthStandardDeviation: double &log;
+        PacketLengthCoefficientofVariation: double &log;
+        PacketTimeMean: double &log;
+        PacketTimeVariance: double &log;
+        PacketTimeStandardDeviation: double &log;
+        PacketTimeCoefficientofVariation: double &log;
+        ResponseTimeTimeMean: double &log;
+        ResponseTimeTimeVariance: double &log;
+        ResponseTimeTimeStandardDeviation: double &log;
+        ResponseTimeTimeCoefficientofVariation: double &log;
+        PacketCount: count &log;
+    };
+}
+
+global check_expired_segments: event();
+
+type ResolverIdx: record {
+    ip: addr;
+};
+
+type RunningStats: record {
+    n: count;
+    s1: double;
+    s2: double;
+};
+
+type ConnectionFeatures: record {
+    len_stats: RunningStats;
+    time_stats: RunningStats;
+    resp_stats: RunningStats;
+    last_packet_ts: time;
+    last_is_orig: bool;
+    pending_req_ts: time;
+    has_pending_req: bool;
+    segment_start_ts: time;
+    bytes_sent: count;
+    bytes_received: count;
+    segment_count: count;
+};
+
+global connection_features_map: table[string] of ConnectionFeatures;
+global conn_id_map: table[string] of conn_id;
+
+event zeek_init() {
+    Log::create_stream(Features, [$columns=Info, $path="features"]);
+
+    system(doh_fetch_script);
+
+    Input::add_table([$source="/XX/doh-resolvers.txt",
+                       $name="doh_resolvers_reader",
+                       $idx=ResolverIdx,
+                       $destination=known_doh_resolvers,
+                       $mode=Input::REREAD]);
+
+    schedule CHECK_INTERVAL { check_expired_segments() };
+}
+
+function is_doh_traffic(c: connection): bool {
+    return ( c$id$resp_p == 443/tcp && c$id$resp_h in known_doh_resolvers );
+}
+
+function new_stats(): RunningStats {
+    return [$n=0, $s1=0.0, $s2=0.0];
+}
+
+function add_value(s: RunningStats, x: double) {
+    s$n += 1;
+    s$s1 += x;
+    s$s2 += x * x;
+}
+
+function stats_mean(s: RunningStats): double {
+    if ( s$n == 0 )
+        return 0.0;
+    return s$s1 / (s$n + 0.0);
+}
+
+function stats_var(s: RunningStats): double {
+    if ( s$n == 0 )
+        return 0.0;
+    local m = stats_mean(s);
+    local v = s$s2 / (s$n + 0.0) - m * m;
+    if ( v < 0.0 )
+        v = 0.0;
+    return v;
+}
+
+function new_segment(now: time): ConnectionFeatures {
+    return [$len_stats=new_stats(),
+            $time_stats=new_stats(),
+            $resp_stats=new_stats(),
+            $last_packet_ts=now,
+            $last_is_orig=T,
+            $pending_req_ts=now,
+            $has_pending_req=F,
+            $segment_start_ts=now,
+            $bytes_sent=0,
+            $bytes_received=0,
+            $segment_count=0];
+}
+
+function init_connection_features(c: connection) {
+    if ( ! is_doh_traffic(c) )
+        return;
+
+    connection_features_map[c$uid] = new_segment(network_time());
+    conn_id_map[c$uid] = c$id;
+}
+
+event connection_established(c: connection) {
+    init_connection_features(c);
+}
+
+event tcp_packet(c: connection, is_orig: bool, flags: string, seq: count,
+                 ack: count, len: count, payload: string) {
+    if ( c$uid !in connection_features_map )
+        return;
+
+    local f = connection_features_map[c$uid];
+    local now = network_time();
+
+    local elapsed = interval_to_double(now - f$segment_start_ts);
+    add_value(f$len_stats, len + 0.0);
+    add_value(f$time_stats, elapsed);
+
+    f$last_packet_ts = now;
+
+    if ( is_orig ) {
+        f$bytes_sent += len;
+        f$pending_req_ts = now;
+        f$has_pending_req = T;
+    }
+    else {
+        f$bytes_received += len;
+        if ( f$has_pending_req ) {
+            local resp_delta = interval_to_double(now - f$pending_req_ts);
+            add_value(f$resp_stats, resp_delta);
+            f$has_pending_req = F;
+        }
+    }
+
+    f$last_is_orig = is_orig;
+    connection_features_map[c$uid] = f;
+}
+
+function write_segment(uid_str: string, cid: conn_id, f: ConnectionFeatures) {
+    local len_mean = stats_mean(f$len_stats);
+    local len_var = stats_var(f$len_stats);
+    local len_std = sqrt(len_var);
+    local len_cv = 0.0;
+    if ( len_mean != 0.0 )
+        len_cv = len_std / len_mean;
+
+    local time_mean = stats_mean(f$time_stats);
+    local time_var = stats_var(f$time_stats);
+    local time_std = sqrt(time_var);
+    local time_cv = 0.0;
+    if ( time_mean != 0.0 )
+        time_cv = time_std / time_mean;
+
+    local resp_mean = stats_mean(f$resp_stats);
+    local resp_var = stats_var(f$resp_stats);
+    local resp_std = sqrt(resp_var);
+    local resp_cv = 0.0;
+    if ( resp_mean != 0.0 )
+        resp_cv = resp_std / resp_mean;
+
+    local duration = interval_to_double(f$last_packet_ts - f$segment_start_ts);
+    local sent_rate = 0.0;
+    local recv_rate = 0.0;
+    if ( duration > 0.0 ) {
+        sent_rate = (f$bytes_sent + 0.0) / duration;
+        recv_rate = (f$bytes_received + 0.0) / duration;
+    }
+
+    local pkt_count = f$len_stats$n;
+    local segment_uid = fmt("%s_seg%d", uid_str, f$segment_count);
+
+    local loghelper: Info = [$ts = f$last_packet_ts,
+        $uid = segment_uid,
+        $id = cid,
+        $FlowBytesSent = f$bytes_sent,
+        $FlowSentRate = sent_rate,
+        $FlowBytesReceived = f$bytes_received,
+        $FlowReceivedRate = recv_rate,
+        $PacketLengthMean = len_mean,
+        $PacketLengthVariance = len_var,
+        $PacketLengthStandardDeviation = len_std,
+        $PacketLengthCoefficientofVariation = len_cv,
+        $PacketTimeMean = time_mean,
+        $PacketTimeVariance = time_var,
+        $PacketTimeStandardDeviation = time_std,
+        $PacketTimeCoefficientofVariation = time_cv,
+        $ResponseTimeTimeMean = resp_mean,
+        $ResponseTimeTimeVariance = resp_var,
+        $ResponseTimeTimeStandardDeviation = resp_std,
+        $ResponseTimeTimeCoefficientofVariation = resp_cv,
+        $PacketCount = pkt_count];
+
+    Log::write(Features, loghelper);
+}
+
+event check_expired_segments() {
+    local now = network_time();
+    local collected_uids: vector of string = vector();
+
+    for ( each_uid in connection_features_map )
+        collected_uids += each_uid;
+
+    for ( idx in collected_uids ) {
+        local current_uid = collected_uids[idx];
+        local f = connection_features_map[current_uid];
+
+        local idle_time = now - f$last_packet_ts;
+        local total_duration = now - f$segment_start_ts;
+
+        if ( idle_time > IDLE_TIMEOUT || total_duration > MAX_DURATION ) {
+            if ( f$len_stats$n > 0 )
+                write_segment(current_uid, conn_id_map[current_uid], f);
+
+            if ( idle_time > IDLE_TIMEOUT ) {
+                delete connection_features_map[current_uid];
+                delete conn_id_map[current_uid];
+            }
+            else {
+                local new_seg = new_segment(now);
+                new_seg$segment_count = f$segment_count + 1;
+                connection_features_map[current_uid] = new_seg;
+            }
+        }
+    }
+
+    schedule CHECK_INTERVAL { check_expired_segments() };
+}
+
+event connection_state_remove(c: connection) {
+    if ( c$uid !in connection_features_map )
+        return;
+
+    local f = connection_features_map[c$uid];
+
+    if ( f$len_stats$n > 0 )
+        write_segment(c$uid, c$id, f);
+
+    delete connection_features_map[c$uid];
+    delete conn_id_map[c$uid];
+}
