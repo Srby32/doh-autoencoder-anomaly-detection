@@ -1,0 +1,121 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Input
+from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import roc_auc_score
+import time
+import json
+
+feature_cols = [
+    'FlowBytesSent', 'FlowSentRate', 'FlowBytesReceived', 'FlowReceivedRate',
+    'PacketLengthMean', 'PacketLengthVariance', 'PacketLengthStandardDeviation',
+    'PacketLengthCoefficientofVariation',
+    'PacketTimeMean', 'PacketTimeVariance', 'PacketTimeStandardDeviation',
+    'PacketTimeCoefficientofVariation',
+    'ResponseTimeTimeMean', 'ResponseTimeTimeVariance',
+    'ResponseTimeTimeStandardDeviation', 'ResponseTimeTimeCoefficientofVariation'
+]
+
+df_16 = pd.read_csv("/xxx/xxx/doh_16.csv")
+df_16["Label"] = df_16["Label"].map({"Benign": 0, "Malicious": 1})
+
+benign_16 = df_16[df_16["Label"] == 0].drop(columns=["Label"])
+malicious_16 = df_16[df_16["Label"] == 1].drop(columns=["Label"])
+
+benign_train, benign_temp = train_test_split(benign_16, test_size=0.30, random_state=42)
+benign_val, benign_test = train_test_split(benign_temp, test_size=0.50, random_state=42)
+
+test_df = pd.concat([
+    benign_test.assign(Label=0),
+    malicious_16.assign(Label=1)
+], ignore_index=True).sample(frac=1, random_state=42).reset_index(drop=True)
+
+tuning_df, final_test_df = train_test_split(
+    test_df, test_size=0.80, stratify=test_df["Label"], random_state=42
+)
+
+tuning_features = tuning_df.drop(columns=["Label"])
+tuning_labels = tuning_df["Label"].values
+
+scaler = MinMaxScaler()
+scaler.fit(benign_train)
+
+X_train_full = pd.DataFrame(scaler.transform(benign_train), columns=feature_cols)
+X_val_full = pd.DataFrame(scaler.transform(benign_val), columns=feature_cols)
+X_tuning_full = pd.DataFrame(scaler.transform(tuning_features), columns=feature_cols)
+
+def get_architecture(n):
+    hidden = max(2, n - 4)
+    bottleneck = max(1, hidden - 4)
+    return hidden, bottleneck
+
+def train_one_run(cols, seed):
+    n = len(cols)
+    hidden, bottleneck = get_architecture(n)
+
+    X_train = X_train_full[cols].values
+    X_val = X_val_full[cols].values
+    X_tuning = X_tuning_full[cols].values
+
+    import tensorflow as tf
+    tf.keras.utils.set_random_seed(seed)
+
+    model = Sequential([
+        Input(shape=(n,)),
+        Dense(hidden, activation='relu'),
+        Dense(bottleneck, activation='relu'),
+        Dense(hidden, activation='relu'),
+        Dense(n, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='mse')
+
+    early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+    model.fit(X_train, X_train, validation_data=(X_val, X_val),
+              epochs=100, batch_size=256, callbacks=[early_stop], verbose=0)
+
+    recon = model.predict(X_tuning, verbose=0)
+    mse = np.mean(np.power(X_tuning - recon, 2), axis=1)
+    auc = roc_auc_score(tuning_labels, mse)
+    return auc
+
+def evaluate_subset_3x(cols):
+    aucs = [train_one_run(cols, seed=s) for s in [1, 2, 3]]
+    return np.mean(aucs), np.std(aucs)
+
+current_features = list(feature_cols)
+results = {}
+elimination_order = []
+
+start_time = time.time()
+
+mean_auc, std_auc = evaluate_subset_3x(current_features)
+results[len(current_features)] = {
+    "mean_auc": mean_auc, "std_auc": std_auc, "features": list(current_features)
+}
+
+while len(current_features) > 1:
+    candidate_scores = {}
+    for feat_to_remove in current_features:
+        candidate_cols = [f for f in current_features if f != feat_to_remove]
+        mean_auc, std_auc = evaluate_subset_3x(candidate_cols)
+        candidate_scores[feat_to_remove] = (mean_auc, std_auc)
+
+    best_removal = max(candidate_scores, key=lambda f: candidate_scores[f][0])
+    best_mean, best_std = candidate_scores[best_removal]
+
+    current_features.remove(best_removal)
+    elimination_order.append(best_removal)
+
+    results[len(current_features)] = {
+        "mean_auc": best_mean, "std_auc": best_std, "features": list(current_features)
+    }
+
+with open("backward_elimination_full_1to16.json", "w") as f:
+    json.dump({
+        "results_by_count": {k: {"mean_auc": v["mean_auc"], "std_auc": v["std_auc"],
+                                   "features": v["features"]} for k, v in results.items()},
+        "elimination_order": elimination_order
+    }, f, indent=2)
