@@ -1,0 +1,52 @@
+import pandas as pd
+import numpy as np
+import joblib
+from tensorflow.keras.models import load_model
+
+scaler = joblib.load("/path/to/models/scaler_v6_16feat.pkl")
+autoencoder = load_model("/path/to/models/autoencoder_v6_16feat.keras", compile=False)
+
+feature_cols = [
+    'FlowBytesSent', 'FlowSentRate', 'FlowBytesReceived', 'FlowReceivedRate',
+    'PacketLengthMean', 'PacketLengthVariance', 'PacketLengthStandardDeviation',
+    'PacketLengthCoefficientofVariation',
+    'PacketTimeMean', 'PacketTimeVariance', 'PacketTimeStandardDeviation',
+    'PacketTimeCoefficientofVariation',
+    'ResponseTimeTimeMean', 'ResponseTimeTimeVariance',
+    'ResponseTimeTimeStandardDeviation', 'ResponseTimeTimeCoefficientofVariation'
+]
+
+column_names = ['ts', 'uid', 'orig_h', 'orig_p', 'resp_h', 'resp_p'] + feature_cols + ['PacketCount']
+
+df = pd.read_csv("/path/to/zeek_scripts/features.log", sep='\t', comment='#', names=column_names)
+
+target_uid = "REPLACE_WITH_TARGET_UID"
+row = df[df['uid'] == target_uid]
+
+if row.empty:
+    print(f"Connection with uid '{target_uid}' not found.")
+else:
+    raw_values = row[feature_cols].values[0]
+    scaled_values = scaler.transform(row[feature_cols])[0]
+
+    print(f"Connection: {target_uid} -> {row['resp_h'].values[0]} "
+          f"(PacketCount: {row['PacketCount'].values[0]})\n")
+
+    print(f"{'Feature':<40} {'Raw Value':>15} {'Scaled':>15} "
+          f"{'Train Min':>12} {'Train Max':>12} {'Out of Range?':>15}")
+    for i, feat in enumerate(feature_cols):
+        out_of_range = "YES" if (scaled_values[i] < 0 or scaled_values[i] > 1) else ""
+        print(f"{feat:<40} {raw_values[i]:>15.4f} {scaled_values[i]:>15.4f} "
+              f"{scaler.data_min_[i]:>12.4f} {scaler.data_max_[i]:>12.4f} {out_of_range:>15}")
+
+    X_scaled = scaler.transform(row[feature_cols])
+    recon = autoencoder.predict(X_scaled, verbose=0)
+    per_feature_error = np.power(X_scaled - recon, 2)[0]
+    total_err = per_feature_error.sum()
+
+    print(f"\n{'Feature':<40} {'Error Contribution':>18} {'Percent':>10}")
+    for i, feat in enumerate(feature_cols):
+        pct = (per_feature_error[i] / total_err * 100) if total_err > 0 else 0
+        print(f"{feat:<40} {per_feature_error[i]:>18.6f} {pct:>9.1f}%")
+
+    print(f"\nMean reconstruction error: {per_feature_error.mean():.6f}")
