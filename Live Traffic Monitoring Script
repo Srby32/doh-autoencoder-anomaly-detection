@@ -1,0 +1,106 @@
+import pandas as pd
+import numpy as np
+import os
+import time
+import joblib
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from tensorflow.keras.models import load_model
+
+log_path = "/path/to/zeek_scripts/features.log"
+model_path = "/path/to/models/autoencoder_v6_16feat.keras"
+scaler_path = "/path/to/models/scaler_v6_16feat.pkl"
+threshold_path = "/path/to/models/threshold_v6_16feat.pkl"
+
+MIN_PACKET_COUNT = 5
+
+autoencoder = load_model(model_path, compile=False)
+scaler = joblib.load(scaler_path)
+threshold = joblib.load(threshold_path)
+
+feature_cols = [
+    'FlowBytesSent', 'FlowSentRate', 'FlowBytesReceived', 'FlowReceivedRate',
+    'PacketLengthMean', 'PacketLengthVariance', 'PacketLengthStandardDeviation',
+    'PacketLengthCoefficientofVariation',
+    'PacketTimeMean', 'PacketTimeVariance', 'PacketTimeStandardDeviation',
+    'PacketTimeCoefficientofVariation',
+    'ResponseTimeTimeMean', 'ResponseTimeTimeVariance',
+    'ResponseTimeTimeStandardDeviation', 'ResponseTimeTimeCoefficientofVariation'
+]
+
+column_names = ['ts', 'uid', 'orig_h', 'orig_p', 'resp_h', 'resp_p'] + feature_cols + ['PacketCount']
+
+TRAIN_MIN = scaler.data_min_
+TRAIN_MAX = scaler.data_max_
+
+last_processed_line_count = 0
+
+
+class LogHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        if event.src_path.endswith("features.log"):
+            analyze_new_lines()
+
+
+def analyze_new_lines():
+    global last_processed_line_count
+
+    try:
+        df = pd.read_csv(log_path, sep='\t', comment='#', names=column_names,
+                          skiprows=last_processed_line_count, low_memory=False)
+    except (pd.errors.EmptyDataError, FileNotFoundError):
+        return
+
+    if df.empty:
+        return
+
+    new_line_count = last_processed_line_count + len(df)
+
+    try:
+        df = df.copy()
+        insufficient_mask = df['PacketCount'] < MIN_PACKET_COUNT
+        df_sufficient = df[~insufficient_mask]
+
+        if not df_sufficient.empty:
+            data = df_sufficient[feature_cols].fillna(0)
+            raw_values = data.values
+            clipped_values = np.clip(raw_values, TRAIN_MIN, TRAIN_MAX)
+
+            clipped_df = pd.DataFrame(clipped_values, columns=feature_cols)
+            data_scaled = scaler.transform(clipped_df)
+
+            reconstructions = autoencoder.predict(data_scaled, verbose=0)
+            mse = np.mean(np.power(data_scaled - reconstructions, 2), axis=1)
+
+            df_sufficient = df_sufficient.copy()
+            df_sufficient['AnomalyScore'] = mse
+            df_sufficient['IsAnomaly'] = df_sufficient['AnomalyScore'] > threshold
+
+            anomalies = df_sufficient[df_sufficient['IsAnomaly']]
+            print(anomalies[['uid', 'resp_h', 'AnomalyScore', 'PacketCount']].to_string(index=False))
+
+    except Exception as e:
+        print(f"Analysis error: {e}")
+
+    finally:
+        last_processed_line_count = new_line_count
+
+
+if __name__ == "__main__":
+    try:
+        existing_df = pd.read_csv(log_path, sep='\t', comment='#', names=column_names, low_memory=False)
+        last_processed_line_count = len(existing_df)
+    except (pd.errors.EmptyDataError, FileNotFoundError):
+        last_processed_line_count = 0
+
+    event_handler = LogHandler()
+    observer = Observer()
+    observer.schedule(event_handler, path=os.path.dirname(log_path), recursive=False)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
