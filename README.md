@@ -11,10 +11,10 @@ All features can be computed in real time while packets arrive.
 
 | Folder | Description |
 |---|---|
-| `feature_selection` | Selects features by removing one feature at a time and checking the AUC on a tuning set. No labels are used during training. |
-| `zeek_feature_extraction` | Zeek script that computes the 16 flow features from live traffic. Flows are split with a 40 second idle timeout and a 90 second duration limit. |
-| `live_monitor` | Reads the features produced by Zeek and scores each flow with the trained model. Flows with fewer than five packets are not scored. |
-| `diagnostics` | Shows how much each feature contributes to the reconstruction error of a flow. |
+| `backward_elimination` | Selects features by removing one feature at a time and checking the AUC on a tuning set. No labels are used during training. |
+| `Real-Time Feature Extraction Script` | Zeek script that computes the 16 flow features from live traffic. Flows are split with a 40 second idle timeout and a 90 second duration limit. |
+| `Live Traffic Monitoring Script` | Reads the features produced by Zeek and scores each flow with the trained model. Flows with fewer than five packets are not scored. |
+| `Per Feature Diagnostic Script` | Shows how much each feature contributes to the reconstruction error of a flow. |
 
 ## Dataset
 
