@@ -48,20 +48,20 @@ X_val_full = pd.DataFrame(scaler.transform(benign_val), columns=feature_cols)
 X_tuning_full = pd.DataFrame(scaler.transform(tuning_features), columns=feature_cols)
 
 def get_architecture(n):
-    hidden = max(2, n - 4)
-    bottleneck = max(1, hidden - 4)
+    hidden = max(1, n - 2)
+    if hidden > 8:
+        bottleneck = 8
+    else:
+        bottleneck = max(1, hidden - 2)
     return hidden, bottleneck
 
-def train_one_run(cols, seed):
+def train_one_run(cols):
     n = len(cols)
     hidden, bottleneck = get_architecture(n)
 
     X_train = X_train_full[cols].values
     X_val = X_val_full[cols].values
     X_tuning = X_tuning_full[cols].values
-
-    import tensorflow as tf
-    tf.keras.utils.set_random_seed(seed)
 
     model = Sequential([
         Input(shape=(n,)),
@@ -82,35 +82,34 @@ def train_one_run(cols, seed):
     return auc
 
 def evaluate_subset_3x(cols):
-    aucs = [train_one_run(cols, seed=s) for s in [1, 2, 3]]
+    aucs = [train_one_run(cols) for _ in range(3)]
     return np.mean(aucs), np.std(aucs)
 
+# Step 1: backward elimination, one training run per candidate
 current_features = list(feature_cols)
-results = {}
+selected_sets = {len(current_features): list(current_features)}
 elimination_order = []
 
 start_time = time.time()
-
-mean_auc, std_auc = evaluate_subset_3x(current_features)
-results[len(current_features)] = {
-    "mean_auc": mean_auc, "std_auc": std_auc, "features": list(current_features)
-}
 
 while len(current_features) > 1:
     candidate_scores = {}
     for feat_to_remove in current_features:
         candidate_cols = [f for f in current_features if f != feat_to_remove]
-        mean_auc, std_auc = evaluate_subset_3x(candidate_cols)
-        candidate_scores[feat_to_remove] = (mean_auc, std_auc)
+        candidate_scores[feat_to_remove] = train_one_run(candidate_cols)
 
-    best_removal = max(candidate_scores, key=lambda f: candidate_scores[f][0])
-    best_mean, best_std = candidate_scores[best_removal]
+    best_removal = max(candidate_scores, key=lambda f: candidate_scores[f])
 
     current_features.remove(best_removal)
     elimination_order.append(best_removal)
+    selected_sets[len(current_features)] = list(current_features)
 
-    results[len(current_features)] = {
-        "mean_auc": best_mean, "std_auc": best_std, "features": list(current_features)
+# Step 2: three training runs for each selected feature set
+results = {}
+for k in sorted(selected_sets, reverse=True):
+    mean_auc, std_auc = evaluate_subset_3x(selected_sets[k])
+    results[k] = {
+        "mean_auc": mean_auc, "std_auc": std_auc, "features": selected_sets[k]
     }
 
 with open("backward_elimination_full_1to16.json", "w") as f:
